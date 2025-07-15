@@ -7,9 +7,9 @@ use std::thread;
 const STATIC_INFO: &str = "INFO {\"host\":\"0.0.0.0\",\"port\":4222,\"headers\":true,\"tls_available\":false,\"max_payload\":1048576,\"jetstream\":false}\r\n";
 
 struct ClientData {
-    subscriptions: Vec<Vec<String>>,
+    subscriptions: Vec<(Vec<String>,String)>,
     stream: TcpStream,
-    
+
 }
 
 //If we want really concurrent and fast topics, I would implement a topic tree but I won't at the beginning.
@@ -25,6 +25,7 @@ fn main() {
         let global_data = Arc::clone(&global_data);
         thread::spawn(|| {
             handle_connection(stream, global_data);
+            println!("Connection terminated")
         });
         println!("Connection established!");
     }
@@ -65,22 +66,46 @@ fn handle_connection(mut stream: TcpStream, global_data: Arc<Mutex<Vec<ClientDat
                 response = Some("PONG\r\n");
             }
             if *action == "SUB" {
-                if words.len() < 3{
+                if words.len() >= 3{
 
                     let topic_unparsed = String::from(*words.get(1).unwrap());
                     let topic :Vec<String> = topic_unparsed.split(".").map(|s| s.to_string()).collect();
-
+                    let subscription_id = String::from(*words.get(2).unwrap());
                     let mut data = global_data.lock().unwrap();
                     if let Some(client) = data.get_mut(index_in_global) {
-                        client.subscriptions.push(topic);
+                        client.subscriptions.push((topic, subscription_id));
                     }
 
+                } else{
                     return;
                 }
                 response = Some("OK\r\n");
             }
+            if *action == "PUB" {
+                if words.len() >= 3 {
+                    let topic_unparsed = String::from(*words.get(1).unwrap());
+                    let topic: Vec<String> = topic_unparsed.split(".").map(|s| s.to_string()).collect();
+                    let message_size = words.get(2).unwrap();
+                    let mut message = vec![b'\0'; message_size.parse().unwrap()];
+                    //TODO could this fail if the message is sent in several packets?
+                    let message_result = buf_reader.read_exact(&mut *message);
+                    if let Err(_) = message_result {
+                        return;
+                    }
+                    response = Some("OK\r\n");
+                    let mut subscription_data = global_data.lock().unwrap();
+                    let num_client = subscription_data.len();
+                    for client in subscription_data.iter_mut() {
+                        if let Some(sub_id) = check_if_subscribed(&client.subscriptions, &topic) {
+                            let full_message = format!("MSG {} {} {}\r\n", topic_unparsed, sub_id,message_size);
+                            let _ = client.stream.write(full_message.as_bytes());
+                            let _ = client.stream.write(&*message);
+                            let _ = client.stream.write("\r\n".as_ref());
+                        }
+                    }
+                }
+            }
         }
-        //}
 
         if let Some(response) = response {
             stream.write_all(response.as_bytes()).unwrap();
@@ -88,21 +113,30 @@ fn handle_connection(mut stream: TcpStream, global_data: Arc<Mutex<Vec<ClientDat
     }
 }
 
-fn check_if_subscribed(topic_list: &Vec<Vec<String>>,  topic_message :&Vec<String>) -> bool {
-    for topic in topic_list {
+//TODO actually test this, probably there are a lot of edge cases
+fn check_if_subscribed(topic_list: &Vec<(Vec<String>,String)>,  topic_message :&Vec<String>) -> Option<String> {
+
+    for subscription in topic_list {
+        let topic = &subscription.0;
+        let sub_id = &subscription.1;
+        let mut subscribed = false;
         for index in 0..topic.len() {
             let sub_topic = topic.get(index).unwrap();
             let sub_topic_message = topic.get(index);
             if sub_topic == "*"  && sub_topic_message.is_some() {
-
+                subscribed = true;
             } else if sub_topic == ">" {
-                return true;
+                return Some(sub_id.clone());
             } else if let Some(some_sub_topic_message) = sub_topic_message && sub_topic== some_sub_topic_message {
-                return true;
+                subscribed = true;
             } else {
-                false;
+                subscribed = false;
+                break;
             }
         }
+        if subscribed {
+            return  Some(sub_id.clone());
+        }
     }
-    true
+    return None;
 }
